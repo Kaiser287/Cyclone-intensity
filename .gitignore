@@ -1,0 +1,22 @@
+# --- BỎ QUA DATA NẶNG (Giữ lại trên máy, không push) ---
+data/
+data_source/
+dataset/
+*.h5
+*.npy
+*.zip
+*.rar
+
+# --- BỎ QUA FILE RÁC HỆ THỐNG ---
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+
+# --- BỎ QUA OUTPUT KHI CHẠY CODE ---
+outputs/
+logs/
+checkpoints/
+runs/
+training.log
