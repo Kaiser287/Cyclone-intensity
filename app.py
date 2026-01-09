@@ -5,186 +5,205 @@ import sys
 import pandas as pd
 import numpy as np
 import time
+import pydeck as pdk # Vẽ 3D
 
-# --- 1. SETUP ĐƯỜNG DẪN ---
+# --- SETUP ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 
 try:
     from source.models.intensity_model import IntensityRegressionModel
     from source.inference.predictor import IntensityPredictor
-    from config import settings
 except ImportError as e:
     st.error(f"❌ Lỗi Import: {e}")
     st.stop()
 
-# --- 2. CẤU HÌNH GIAO DIỆN DARK MODE ---
-st.set_page_config(page_title="Hệ thống Cảnh báo Bão AI", page_icon="🌪️", layout="wide")
-
-# CSS Ép màu đen toàn tập
+# --- CẤU HÌNH DARK MODE ---
+st.set_page_config(page_title="AI Typhoon Center", page_icon="🌪️", layout="wide")
 st.markdown("""
     <style>
-    /* 1. Nền đen */
-    .stApp {
-        background-color: #000000;
-        color: #ffffff;
-    }
-    
-    /* 2. Chỉnh màu chữ thành trắng */
-    h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {
-        color: #ffffff !important;
-    }
-    
-    /* 3. Chỉnh các ô nhập liệu (Input) */
-    .stNumberInput input, .stTextInput input {
-        color: white;
-        background-color: #333333;
-    }
-    
-    /* 4. Nút bấm đẹp */
-    .stButton>button {
-        background-color: #ff4b4b;
-        color: white;
-        border: 1px solid #ff4b4b;
-        width: 100%;
-        font-weight: bold;
-    }
-    .stButton>button:hover {
-        border-color: white;
-    }
-    
-    /* 5. Khung Metric kết quả */
-    div[data-testid="stMetricValue"] {
-        color: #00ff00 !important; /* Số kết quả màu xanh lá cho nổi */
-    }
-    div[data-testid="stMetricLabel"] {
-        color: #dddddd !important;
-    }
+    .stApp { background-color: #0e1117; color: #ffffff; }
+    h1, h2, h3 { color: #ffffff !important; }
+    .stButton>button { background-color: #d93025; color: white; font-weight: bold; border: none; height: 50px; width: 100%; }
+    div[data-testid="stMetricValue"] { color: #4caf50 !important; font-size: 26px !important; }
+    .report-box { background-color: #1e1e1e; padding: 20px; border-radius: 5px; border-left: 5px solid #d93025; font-family: monospace; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 3. HÀM LOAD MODEL ---
+# --- LOAD MODEL ---
 @st.cache_resource
 def load_ai_engine():
     model_path = os.path.join(BASE_DIR, "outputs", "best_model.pth")
-    if not os.path.exists(model_path):
-        return None, "⚠️ Chưa có file model! Hãy copy 'best_model.pth' vào folder 'outputs'."
+    if not os.path.exists(model_path): return None, "Thiếu file best_model.pth"
     try:
         model = IntensityRegressionModel(backbone='resnet50', input_channels=3, pretrained=False)
         predictor = IntensityPredictor(model, checkpoint_path=model_path)
         return predictor, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
-# --- 4. HÀM TÍNH TOÁN ĐƯỜNG ĐI (QUÁN TÍNH) ---
-def predict_track(lat_old, lon_old, lat_curr, lon_curr):
-    """
-    Dự báo vị trí tương lai dựa trên vector di chuyển
-    """
-    delta_lat = lat_curr - lat_old
-    delta_lon = lon_curr - lon_old
+# --- 1. THUẬT TOÁN VẼ 3D (Đã Fix lỗi Numpy cho Python 3.7) ---
+def generate_3d_storm_data(image, center_lat, center_lon):
+    img_small = image.resize((60, 60)).convert('L') # Resize để vẽ mượt
+    pixels = np.array(img_small)
+    data = []
+    lat_step, lon_step = 0.05, 0.05
+    rows, cols = pixels.shape
     
-    future_points = []
-    # Điểm hiện tại
-    future_points.append({"lat": lat_curr, "lon": lon_curr, "type": "Hiện tại", "time": "+0h"})
+    # [FIX QUAN TRỌNG]: Ép kiểu center_lat/lon về float chuẩn
+    center_lat = float(center_lat)
+    center_lon = float(center_lon)
+
+    for r in range(rows):
+        for c in range(cols):
+            # [FIX QUAN TRỌNG]: Ép kiểu numpy.uint8 -> int chuẩn của Python
+            brightness = int(pixels[r, c]) 
+            
+            if brightness > 40: # Chỉ vẽ mây rõ
+                # Ép kiểu float chuẩn
+                height = float((brightness / 255.0) * 70000) 
+                
+                # Tính toán màu sắc (ép kiểu int)
+                color = [int(brightness), int(brightness), int(255-brightness), 200]
+                
+                # Tính tọa độ (ép kiểu float)
+                lat = float(center_lat - (r - rows/2) * lat_step)
+                lon = float(center_lon + (c - cols/2) * lon_step)
+                
+                data.append({"lat": lat, "lon": lon, "height": height, "color": color})
+    return pd.DataFrame(data)
+
+# --- 2. THUẬT TOÁN ĐƯỜNG ĐI (CLIPER + Coriolis) ---
+def predict_track_advanced(lat_old, lon_old, lat_curr, lon_curr):
+    # Ép kiểu float đầu vào để tránh lỗi
+    lat_curr, lon_curr = float(lat_curr), float(lon_curr)
+    lat_old, lon_old = float(lat_old), float(lon_old)
+
+    v_lat = lat_curr - lat_old
+    v_lon = lon_curr - lon_old
     
-    # Dự báo 24h tới
-    for i in range(1, 5): 
-        next_lat = lat_curr + (delta_lat * i)
-        next_lon = lon_curr + (delta_lon * i)
-        future_points.append({
-            "lat": next_lat,
-            "lon": next_lon,
-            "type": "Dự báo",
-            "time": f"+{i*6}h"
-        })
+    points = []
+    points.append({"lat": lat_old, "lon": lon_old, "type": "Quá khứ (-6h)", "size": 5000, "color": [100, 100, 100]})
+    points.append({"lat": lat_curr, "lon": lon_curr, "type": "TÂM BÃO (Hiện tại)", "size": 10000, "color": [255, 0, 0]})
+    
+    next_lat, next_lon = lat_curr, lon_curr
+    curr_v_lat, curr_v_lon = v_lat, v_lon
+    
+    # Dự báo 12 bước (72h)
+    for i in range(1, 13): 
+        beta_lat = 0.05 
+        beta_lon = -0.02
         
-    return pd.DataFrame(future_points)
+        steer_lat, steer_lon = 0.0, 0.0
+        if next_lat > 20.0:
+            steer_lon = 0.08 * (next_lat - 20.0)
+            steer_lat = 0.02
+        
+        curr_v_lat = (curr_v_lat * 0.9) + beta_lat + steer_lat
+        curr_v_lon = (curr_v_lon * 0.9) + beta_lon + steer_lon
+        
+        next_lat += curr_v_lat
+        next_lon += curr_v_lon
+        
+        points.append({
+            "lat": float(next_lat), "lon": float(next_lon), 
+            "type": f"Dự báo (+{i*6}h)", "size": 5000, "color": [255, 165, 0]
+        })
+    return pd.DataFrame(points)
 
-# =========================================================
-# GIAO DIỆN CHÍNH
-# =========================================================
-
-st.title("🌪️ AI CYCLONE TRACKER")
-st.caption("Deep Learning Core: ResNet50 | Algorithm: Persistence Forecast")
+# ================= GIAO DIỆN CHÍNH =================
+st.title("🇻🇳 TRUNG TÂM CẢNH BÁO BÃO AI (VN-S)")
+st.caption("Deep Learning Core | 3D Visualization | CLIPER Track Forecast")
 st.markdown("---")
 
-left_col, right_col = st.columns([1, 1.5])
+# Session State
+if 'result' not in st.session_state: st.session_state['result'] = None
+if 'img_cache' not in st.session_state: st.session_state['img_cache'] = None
 
-# --- CỘT TRÁI: AI DỰ ĐOÁN ---
-with left_col:
-    st.subheader("📡 Phân tích ảnh vệ tinh")
-    
+col_left, col_right = st.columns([1, 1.5])
+
+# === CỘT TRÁI: INPUT & AI ===
+with col_left:
+    st.subheader("1. Dữ liệu Vệ tinh")
     predictor, err = load_ai_engine()
     if err: st.error(err)
     
-    uploaded_file = st.file_uploader("Upload ảnh vệ tinh (IR):", type=["jpg", "png", "jpeg"])
+    uploaded_file = st.file_uploader("Upload ảnh vệ tinh (IR):", type=["jpg", "png"])
+    
+    c1, c2 = st.columns(2)
+    with c1: lat_input = st.number_input("Vĩ độ Tâm bão", 16.0)
+    with c2: lon_input = st.number_input("Kinh độ Tâm bão", 110.0)
     
     if uploaded_file:
-        # Hiển thị ảnh (Đã sửa code cũ lỗi)
-        st.image(uploaded_file, caption="Input Satellite Image", use_column_width=True)
-        
-        if st.button("🚀 PHÂN TÍCH (ANALYZE)"):
-            if predictor:
-                with st.spinner("AI Computing..."):
-                    time.sleep(1) 
-                    result = predictor.predict(Image.open(uploaded_file))
-                
-                # --- PHẦN TÍNH TOÁN ĐỔI ĐƠN VỊ ---
-                knots = result['wind_speed']
-                kmh = round(knots * 1.852, 1) # Công thức chuẩn: 1 kts = 1.852 km/h
-                
-                # Hiển thị kết quả
-                st.success("Analysis Complete!")
-                
-                # --- CHIA THÀNH 3 CỘT (Knots | Km/h | Phân loại) ---
-                c1, c2, c3 = st.columns(3)
-                
-                with c1:
-                    st.metric("Sức gió (Knots)", f"{knots} kts")
-                
-                with c2:
-                    # Hiển thị Km/h màu xanh cho nổi bật
-                    st.metric("Sức gió (Km/h)", f"{kmh} km/h", delta="VN Standard")
-                    
-                with c3:
-                    st.metric("Phân loại", result['lifecycle'])
-                
-                # Box màu cảnh báo (Giữ nguyên)
-                st.markdown(f"""
-                <div style="background:{result.get('color','gray')}; padding:15px; border-radius:8px; color:white; text-align:center; font-weight:bold; font-size:18px; border: 2px solid white; margin-top: 10px;">
-                    {result['lifecycle'].upper()}
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.write("Intensity Index:")
-                st.progress(min(knots/150, 1.0))
+        img = Image.open(uploaded_file)
+        st.image(img, caption="Ảnh vệ tinh gốc", use_column_width=True)
+        if st.button("🚀 KÍCH HOẠT PHÂN TÍCH"):
+            with st.spinner("AI đang tính toán (Gió, Mưa, Cấu trúc)..."):
+                time.sleep(1)
+                st.session_state['result'] = predictor.predict(img)
+                st.session_state['img_cache'] = img
 
-# --- CỘT PHẢI: BẢN ĐỒ (ĐÃ FIX LỖI) ---
-with right_col:
-    st.subheader("🗺️ Dự báo đường đi (Track Map)")
-    
-    c_lat, c_lon = st.columns(2)
-    with c_lat:
-        st.write("📍 **Vị trí cũ (-6h):**")
-        lat_prev = st.number_input("Vĩ độ (Lat)", value=15.5, key="lat1")
-        lon_prev = st.number_input("Kinh độ (Lon)", value=111.0, key="lon1")
-    
-    with c_lon:
-        st.write("📍 **Vị trí hiện tại (Now):**")
-        lat_now = st.number_input("Vĩ độ (Lat)", value=16.2, key="lat2")
-        lon_now = st.number_input("Kinh độ (Lon)", value=110.5, key="lon2")
+# === CỘT PHẢI: KẾT QUẢ ĐA CHIỀU ===
+with col_right:
+    if st.session_state['result']:
+        res = st.session_state['result']
+        kmh = round(res['wind_speed'] * 1.852, 1)
+        
+        # TAB GIAO DIỆN
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 THÔNG SỐ", "🧊 CẤU TRÚC 3D", "🗺️ ĐƯỜNG ĐI", "📜 CÔNG ĐIỆN"])
+        
+        with tab1: # Thông số
+            r1c1, r1c2 = st.columns(2)
+            r1c1.metric("Sức gió (Km/h)", f"{kmh}", delta="Chuẩn VN")
+            r1c2.metric("Sức gió (Knots)", f"{res['wind_speed']}")
+            
+            r2c1, r2c2 = st.columns(2)
+            r2c1.metric("Lượng mưa (1h)", f"{res['rainfall']} mm")
+            r2c2.markdown(f"<div style='color:{res['color']}; font-weight:bold; font-size:20px'>{res['lifecycle']}</div>", unsafe_allow_html=True)
+            st.progress(min(res['wind_speed']/180, 1.0))
 
-    if st.button("📍 VẼ ĐƯỜNG ĐI (PROJECT TRACK)"):
-        track_data = predict_track(lat_prev, lon_prev, lat_now, lon_now)
-        
-        st.write("### Simulation Result (24h)")
-        
-        # [FIX QUAN TRỌNG]: Đã xóa 'size=20000' để không bị lỗi trên máy bạn
-        st.map(track_data, zoom=5)
-        
-        # Hiện bảng dữ liệu
-        st.table(track_data[['time', 'lat', 'lon', 'type']])
+        with tab2: # 3D Map
+            st.info("💡 Xoay chuột để thấy tường mắt bão dựng đứng!")
+            # Gọi hàm đã fix lỗi
+            df_3d = generate_3d_storm_data(st.session_state['img_cache'], lat_input, lon_input)
+            
+            layer = pdk.Layer(
+                "ColumnLayer", data=df_3d, get_position=["lon", "lat"],
+                get_elevation="height", elevation_scale=1, radius=4000,
+                get_fill_color="color", pickable=True, auto_highlight=True,
+            )
+            view_state = pdk.ViewState(latitude=float(lat_input), longitude=float(lon_input), zoom=6, pitch=60)
+            st.pydeck_chart(pdk.Deck(initial_view_state=view_state, layers=[layer]))
 
-st.markdown("---")
-st.caption("System Status: ONLINE | GPU: Active")
+        with tab3: # Đường đi
+            st.write("Dự báo quỹ đạo (Mô hình CLIPER + Beta Drift)")
+            c_lat, c_lon = st.columns(2)
+            with c_lat: lat_old = st.number_input("Vĩ độ cũ (-6h)", float(lat_input) - 0.5)
+            with c_lon: lon_old = st.number_input("Kinh độ cũ (-6h)", float(lon_input) + 0.5)
+            
+            if st.button("📍 VẼ ĐƯỜNG ĐI"):
+                track_df = predict_track_advanced(lat_old, lon_old, lat_input, lon_input)
+                # Dùng tham số cơ bản cho st.map để tránh lỗi phiên bản cũ
+                st.map(track_df, zoom=4) 
+                # Hiển thị chú thích màu riêng
+                st.caption("🔴 Đỏ: Hiện tại | 🟠 Cam: Dự báo | ⚫ Xám: Quá khứ")
+
+        with tab4: # Báo cáo
+            report = f"""
+            === CÔNG ĐIỆN KHẨN (TỰ ĐỘNG) ===
+            THỜI GIAN: {time.strftime("%H:%M %d/%m/%Y")}
+            VỊ TRÍ TÂM: {lat_input}N - {lon_input}E
+            --------------------------------
+            1. HIỆN TRẠNG:
+               - Cường độ: {res['lifecycle'].upper()}
+               - Gió mạnh nhất: {kmh} km/h (Cấp {int(kmh/15)+6})
+               - Mưa dự báo: {res['rainfall']} mm/h
+            2. DỰ BÁO:
+               - Bão di chuyển phức tạp theo hướng Tây Bắc.
+               - Nguy cơ ngập lụt vùng tâm bão đi qua: CAO.
+            --------------------------------
+            SYSTEM: AI STORM SENTINEL V1.0
+            """
+            st.markdown(f"<div class='report-box'><pre>{report}</pre></div>", unsafe_allow_html=True)
+            
+    else:
+        st.info("👈 Vui lòng Upload ảnh và chạy hệ thống.")
