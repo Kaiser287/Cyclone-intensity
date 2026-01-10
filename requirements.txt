@@ -1,0 +1,9 @@
+torch
+torchvision
+streamlit
+pandas
+numpy
+Pillow
+pydeck
+tqdm
+openpyxl

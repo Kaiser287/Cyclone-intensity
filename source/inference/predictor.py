@@ -18,16 +18,16 @@ class BasePredictor:
 
     def load_checkpoint(self, checkpoint_path):
         if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"❌ Không tìm thấy checkpoint: {checkpoint_path}")
+            raise FileNotFoundError(f"❌ Checkpoint not found: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             if 'model_state_dict' in checkpoint:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 self.model.load_state_dict(checkpoint)
-            print(f"✅ Load model thành công!")
+            print(f"✅ Model loaded successfully!")
         except Exception as e:
-            print(f"❌ Lỗi load checkpoint: {e}")
+            print(f"❌ Error loading checkpoint: {e}")
 
     def preprocess(self, img_input):
         if isinstance(img_input, str):
@@ -48,8 +48,30 @@ class BasePredictor:
         raise NotImplementedError
 
 class IntensityPredictor(BasePredictor):
+    
+    # === [HÀM MỚI] HIỆU CHỈNH THÔNG MINH ===
+    def calibrate_smart(self, raw_val):
+        """
+        Hàm này giúp chỉnh riêng bão Trung bình mà không ảnh hưởng bão To.
+        """
+        # 1. Bão Cận Siêu Bão & Siêu Bão (> 95 Knots)
+        # Bạn bảo đoạn này đã chuẩn -> Giữ nguyên (Hệ số 1.0)
+        if raw_val >= 95:
+            return raw_val * 1.0 
+        
+        # 2. Bão Trung Bình & Mạnh (60 - 95 Knots)
+        # Đoạn này "chưa oke lắm". Thường model sẽ đoán thấp hơn thực tế.
+        # -> Thử nhân nhẹ lên 1.15 hoặc 1.2 xem sao.
+        elif 60 <= raw_val < 95:
+            return raw_val * 2.84  # <--- CHỈNH SỐ NÀY (Tăng lên nếu muốn bão to hơn)
+            
+        # 3. Bão Yếu & Áp thấp (< 60 Knots)
+        # Có thể cần nhân mạnh hơn chút vì mây rất loãng
+        else:
+            return raw_val * 2.5   # <--- CHỈNH SỐ NÀY
+            
     def predict(self, img_input):
-        # 1. GIỮ ẢNH GỐC ĐỂ TÍNH ĐỘ SÁNG
+        # 1. Xử lý ảnh
         if isinstance(img_input, str):
             original_img = Image.open(img_input).convert('L')
         elif isinstance(img_input, np.ndarray):
@@ -57,50 +79,32 @@ class IntensityPredictor(BasePredictor):
         else:
             original_img = img_input.convert('L')
 
-        # 2. AI DỰ ĐOÁN GIÓ
+        # 2. AI Dự đoán (Ra giá trị thô)
         img_tensor = self.preprocess(img_input)
         with torch.no_grad():
             output = self.model(img_tensor)
         
         raw_output = output.cpu().item()
         
-        # [QUAN TRỌNG] Vẫn dùng Model cũ -> Giữ hệ số 2.84
-        WIND_CORRECTION = 2.84 
+        # 3. ÁP DỤNG HIỆU CHỈNH THÔNG MINH
+        # Thay vì nhân một số cố định, ta gọi hàm calibrate_smart
+        final_wind_speed = self.calibrate_smart(raw_output)
         
-        final_wind_speed = raw_output * WIND_CORRECTION
-        final_wind_speed = max(10, min(final_wind_speed, 185))
+        # Chặn trần/sàn cho hợp lý
+        final_wind_speed = max(15, min(final_wind_speed, 185))
 
-        # ==========================================================
-        # 🌧️ CÔNG THỨC TÍNH MƯA (Đã tách riêng hệ số)
-        # ==========================================================
-        
-        # Lấy độ sáng mây (0-255)
+        # 4. TÍNH LƯỢNG MƯA
         pixel_array = np.array(original_img)
         cloud_brightness = np.percentile(pixel_array, 90) 
         
-        # Tính mưa sơ bộ
-        # 1. Mưa do gió (Wind): Gió 100kts -> Mưa ~50mm
-        rain_wind = final_wind_speed * 0.5 
+        rain_from_wind = final_wind_speed * 0.5 
+        rain_from_cloud = (cloud_brightness / 255.0) * 100.0
         
-        # 2. Mưa do mây (Cloud): Mây trắng xoá -> Mưa ~80mm
-        rain_cloud = (cloud_brightness / 255.0) * 100.0
-        
-        # Tổng hợp (Mây quan trọng hơn gió một chút)
-        raw_rain = (rain_wind * 0.4) + (rain_cloud * 0.6)
-        
-        # [CHỈNH Ở ĐÂY] Hệ số chỉnh mưa riêng biệt
-        # Nếu mưa đang quá BÉ -> Tăng lên 1.2, 1.5...
-        # Nếu mưa đang quá TO -> Giảm xuống 0.8, 0.6...
-        RAIN_SCALE = 1.5
-        
-        rainfall = raw_rain * RAIN_SCALE
-        
-        # Chặn giá trị hợp lý (5mm - 200mm)
-        rainfall = max(5.0, min(rainfall, 200.0))
-        # ==========================================================
+        rainfall = (rain_from_wind * 0.4) + (rain_from_cloud * 0.6)
+        rainfall = max(5.0, min(rainfall * 1.0, 200.0))
 
-        # Phân loại
-        lifecycle_info = self.classify_vietnam_scale(final_wind_speed)
+        # 5. PHÂN LOẠI (English Interface)
+        lifecycle_info = self.classify_international_scale(final_wind_speed)
         
         return {
             "wind_speed": round(final_wind_speed, 2), 
@@ -109,23 +113,19 @@ class IntensityPredictor(BasePredictor):
             "color": lifecycle_info['color']
         }
 
-    def classify_vietnam_scale(self, wind_knots):
-        """
-        Chuyển đổi Knots -> Km/h -> Cấp bão Việt Nam
-        """
+    def classify_international_scale(self, wind_knots):
         kmh = wind_knots * 1.852
-        
+        kmh = round(kmh, 1)
+
         if kmh < 62:
-            return {"label": "ÁP THẤP NHIỆT ĐỚI (Cấp 6-7)", "color": "#008000"} 
+            return {"label": "TROPICAL DEPRESSION (TD)", "color": "#008000"} 
         elif 62 <= kmh <= 88:
-            return {"label": "BÃO THƯỜNG (Cấp 8-9)", "color": "#CCCC00"} 
+            return {"label": "TROPICAL STORM (TS)", "color": "#CCCC00"} 
         elif 89 <= kmh <= 117:
-            return {"label": "BÃO MẠNH (Cấp 10-11)", "color": "#FF8C00"} 
-        elif 118 <= kmh <= 133:
-            return {"label": "BÃO RẤT MẠNH (Cấp 12)", "color": "#FF4500"} 
-        elif 134 <= kmh <= 166:
-            return {"label": "BÃO RẤT MẠNH (Cấp 13-14)", "color": "#FF0000"} 
-        elif 167 <= kmh <= 183:
-            return {"label": "BÃO DỮ DỘI (Cấp 15)", "color": "#8B0000"} 
+            return {"label": "SEVERE TROPICAL STORM", "color": "#FF8C00"} 
+        elif 118 <= kmh <= 156:
+            return {"label": "TYPHOON (Cat 1-2)", "color": "#FF4500"} 
+        elif 157 <= kmh <= 183:
+            return {"label": "VERY STRONG TYPHOON (Cat 3-4)", "color": "#FF0000"} 
         else:
-            return {"label": "SIÊU BÃO (Trên cấp 16)", "color": "#800080"}
+            return {"label": "SUPER TYPHOON (Cat 5+)", "color": "#800080"}
