@@ -78,87 +78,102 @@ def generate_expanded_3d_data(image, center_lat, center_lon):
                 data.append({"lat": lat, "lon": lon, "height": height, "color": color})
     return pd.DataFrame(data)
 
-# --- 2. ADVANCED TRACK PREDICTION (Historical Weighting) ---
-# --- 2. ADVANCED TRACK PREDICTION (CLIPER + STEERING + CONE) ---
-def predict_track_advanced(lat_now, lon_now, lat_24, lon_24, lat_48, lon_48):
+# --- 2. AI-ASSISTED TRACK PREDICTION (HYBRID MODEL) ---
+def predict_track_ai_assisted(lat_now, lon_now, lat_24, lon_24, lat_48, lon_48, ai_wind_speed):
     """
-    Thuật toán giả lập CLIPER (Climatology and Persistence)
-    Kết hợp dòng dẫn đường (Steering Flow) để tạo đường cong tự nhiên.
+    Dự báo đường đi có tham chiếu Cường độ gió từ AI.
+    - AI gió to -> Quán tính lớn, trôi dạt Beta mạnh.
+    - AI gió nhỏ -> Dễ bị bẻ hướng.
     """
-    # 1. TÍNH VẬN TỐC QUÁN TÍNH (PERSISTENCE)
+    # 1. TÍNH VẬN TỐC QUÁ KHỨ
     v_lat_recent = (lat_now - lat_24) / 4.0 
     v_lon_recent = (lon_now - lon_24) / 4.0
     v_lat_old = (lat_24 - lat_48) / 4.0
     v_lon_old = (lon_24 - lon_48) / 4.0
     
-    # Trọng số: 60% xu hướng mới + 40% xu hướng cũ
+    # Trọng số cơ bản
     curr_v_lat = (v_lat_recent * 0.6) + (v_lat_old * 0.4)
     curr_v_lon = (v_lon_recent * 0.6) + (v_lon_old * 0.4)
 
-    # 2. KHỞI TẠO DỮ LIỆU VẼ
+    # === [AI INTEGRATION] DÙNG GIÓ CỦA AI ĐỂ CHỈNH THAM SỐ ===
+    # Chuẩn hóa gió về khoảng 0.0 - 1.0 (Lấy max là 150 kts)
+    intensity_factor = min(ai_wind_speed / 150.0, 1.0)
+    
+    # Bão càng mạnh -> Quán tính (Inertia) càng lớn
+    # Gió 150kts -> Giữ 95% hướng cũ. Gió 30kts -> Giữ 70% hướng cũ.
+    INERTIA = 0.7 + (intensity_factor * 0.25) 
+    
+    # Bão càng mạnh -> Hiệu ứng Beta (tự trôi Tây Bắc) càng rõ
+    BETA_FORCE = 0.05 + (intensity_factor * 0.05)
+
+    # Kích tốc độ ban đầu (Speed Boost)
+    SPEED_MULTIPLIER = 1.8 
+    curr_v_lat *= SPEED_MULTIPLIER
+    curr_v_lon *= SPEED_MULTIPLIER
+    
+    # Đảm bảo tốc độ tối thiểu
+    current_speed = (curr_v_lat**2 + curr_v_lon**2)**0.5
+    if current_speed < 0.5:
+        scale = 0.5 / current_speed if current_speed > 0 else 1.0
+        curr_v_lat *= scale
+        curr_v_lon *= scale
+
+    # Khởi tạo vẽ
     track_points = []
-    cone_points = [] # Dữ liệu vùng nón nguy hiểm
+    cone_points = []
     
     # Điểm quá khứ
     track_points.append({"lat": lat_48, "lon": lon_48, "type": "History (-48h)", "size": 3000, "color": [100, 100, 100]})
     track_points.append({"lat": lat_24, "lon": lon_24, "type": "History (-24h)", "size": 4000, "color": [150, 150, 150]})
-    track_points.append({"lat": lat_now, "lon": lon_now, "type": "CURRENT CENTER", "size": 10000, "color": [255, 0, 0]}) # Đỏ
+    track_points.append({"lat": lat_now, "lon": lon_now, "type": "CURRENT CENTER", "size": 12000, "color": [255, 0, 0]}) 
     
     next_lat, next_lon = lat_now, lon_now
     
-    # Dự báo 72h (12 bước, mỗi bước 6h)
-    forecast_hours = [24, 48, 72]
+    # [YÊU CẦU MỚI] Chỉ dự báo đến 48h (Bỏ 72h)
+    forecast_hours = [24, 36, 48] 
     
-    # Bán kính vùng nguy hiểm ban đầu (km)
+    # Chạy vòng lặp 8 bước (8 * 6h = 48h)
     cone_radius = 50 
     
-    for step in range(1, 13): 
-        # --- THUẬT TOÁN STEERING FLOW (DÒNG DẪN) ---
-        # 1. Beta Drift (Trôi dạt tự nhiên về phía Tây Bắc do trái đất quay)
-        beta_lat = 0.05 
-        beta_lon = -0.02
+    for step in range(1, 9): 
+        # Logic dòng dẫn (Steering Flow)
+        beta_lat = BETA_FORCE  # Dùng số liệu từ AI
+        beta_lon = -0.05
         
-        # 2. Environmental Steering (Giả lập Áp cao cận nhiệt đới)
         steer_lat, steer_lon = 0.0, 0.0
         
         if next_lat < 20.0:
-            # Vùng vĩ độ thấp: Gió Tín phong đẩy mạnh về phía Tây
-            steer_lon = -0.15 
-            steer_lat = 0.02
-        elif 20.0 <= next_lat < 28.0:
-            # Vùng chuyển tiếp (Recurvature Point): Bão đi chậm lại, bắt đầu quặt Bắc
-            steer_lon = -0.05 + ((next_lat - 20.0) * 0.02) # Giảm tốc độ sang Tây
-            steer_lat = 0.08 # Tăng tốc độ lên Bắc
+            steer_lon = -0.35; steer_lat = 0.08
+        elif 20.0 <= next_lat < 25.0:
+            steer_lon = -0.15 + ((next_lat - 20.0) * 0.05); steer_lat = 0.2
         else:
-            # Vĩ độ cao (> 28N): Gió Tây ôn đới đẩy mạnh sang Đông Bắc (Bão quặt ra biển)
-            steer_lon = 0.2 + ((next_lat - 28.0) * 0.05) 
-            steer_lat = 0.1
+            steer_lon = 0.4 + ((next_lat - 25.0) * 0.15); steer_lat = 0.25
             
-        # Tổng hợp lực: 70% Quán tính cũ + 30% Môi trường mới
-        curr_v_lat = (curr_v_lat * 0.7) + (steer_lat + beta_lat) * 0.3
-        curr_v_lon = (curr_v_lon * 0.7) + (steer_lon + beta_lon) * 0.3
+        # Tổng hợp lực (Có tham số INERTIA từ AI)
+        curr_v_lat = (curr_v_lat * INERTIA) + (steer_lat + beta_lat) * (1 - INERTIA)
+        curr_v_lon = (curr_v_lon * INERTIA) + (steer_lon + beta_lon) * (1 - INERTIA)
+        
+        # Gia tốc (Càng về sau càng nhanh)
+        curr_v_lat *= 1.05
+        curr_v_lon *= 1.05
         
         next_lat += curr_v_lat
         next_lon += curr_v_lon
         
-        # Mở rộng vùng nón nguy hiểm theo thời gian (Càng xa càng sai số lớn)
-        cone_radius += 15 # Mỗi 6h bán kính sai số tăng thêm 15km
+        cone_radius += 20 
         
         hour_mark = step * 6
         if hour_mark in forecast_hours:
-            # Điểm tâm bão
             track_points.append({
                 "lat": float(next_lat), "lon": float(next_lon), 
                 "type": f"Forecast (+{hour_mark}h)", 
-                "size": 6000, 
-                "color": [255, 165, 0] # Cam
+                "size": 6000 + (step * 300), 
+                "color": [255, 165, 0]
             })
             
-            # Tạo hình tròn bao quanh (Vùng nguy hiểm)
-            # Lưu ý: Pydeck cần polygon, ở đây ta lưu tâm & bán kính để vẽ sau
             cone_points.append({
                 "lat": float(next_lat), "lon": float(next_lon),
-                "radius": cone_radius * 1000 # Đổi ra mét
+                "radius": cone_radius * 1000 
             })
             
     return pd.DataFrame(track_points), cone_points
@@ -242,58 +257,40 @@ with col_right:
             st.pydeck_chart(pdk.Deck(initial_view_state=view_state, layers=[layer]))
 
         with tab3:
-            st.write("Using CLIPER + Environmental Steering Model")
+            st.write("Using AI-Enhanced CLIPER Model")
+            st.info(f"ℹ️ Track prediction is adjusted based on AI estimated intensity: **{res['wind_speed']} kts**")
             
             if st.button("📍 GENERATE FORECAST TRACK"):
-                # Gọi hàm mới
-                track_df, cone_data = predict_track_advanced(lat_input, lon_input, lat_24, lon_24, lat_48, lon_48)
+                # Gọi hàm mới, truyền thêm tham số res['wind_speed']
+                track_df, cone_data = predict_track_ai_assisted(
+                    lat_input, lon_input, lat_24, lon_24, lat_48, lon_48, 
+                    res['wind_speed']  # <--- DỮ LIỆU TỪ MODEL ĐÃ TRAIN
+                )
                 
-                # --- LAYER 1: VÙNG NÓN NGUY HIỂM (CONE OF UNCERTAINTY) ---
-                # Vẽ các vòng tròn mờ bao quanh điểm dự báo
+                # --- VẼ LAYER (Giữ nguyên như cũ) ---
                 cone_layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=cone_data,
-                    get_position=["lon", "lat"],
-                    get_radius="radius",
-                    get_fill_color=[255, 165, 0, 80], # Màu cam, độ trong suốt 80 (nhìn xuyên thấu)
-                    get_line_color=[255, 0, 0, 0],
-                    pickable=False,
+                    "ScatterplotLayer", data=cone_data, get_position=["lon", "lat"],
+                    get_radius="radius", get_fill_color=[255, 165, 0, 80],
+                    get_line_color=[255, 0, 0, 0], pickable=False,
                 )
 
-                # --- LAYER 2: ĐƯỜNG ĐI NỐI CÁC ĐIỂM ---
-                # Tạo đường nối (Path) từ dữ liệu track_df
-                # (Pydeck cần format riêng cho PathLayer, nhưng để đơn giản ta dùng Scatterplot nối tiếp)
-                # Hoặc chỉ cần vẽ các điểm là đủ đẹp rồi.
-
-                # --- LAYER 3: CÁC ĐIỂM DỰ BÁO (TÂM BÃO) ---
                 track_layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=track_df,
-                    get_position=["lon", "lat"],
-                    get_radius="size",
-                    get_fill_color="color",
-                    pickable=True,
-                    auto_highlight=True,
+                    "ScatterplotLayer", data=track_df, get_position=["lon", "lat"],
+                    get_radius="size", get_fill_color="color",
+                    pickable=True, auto_highlight=True,
                 )
                 
-                # Hiển thị bản đồ
-                view_state = pdk.ViewState(
-                    latitude=float(lat_input), 
-                    longitude=float(lon_input), 
-                    zoom=4,
-                    pitch=0
-                )
+                view_state = pdk.ViewState(latitude=float(lat_input), longitude=float(lon_input), zoom=4, pitch=0)
                 
                 st.pydeck_chart(pdk.Deck(
                     initial_view_state=view_state, 
-                    layers=[cone_layer, track_layer], # Vẽ Cone trước (nằm dưới), Track sau (nằm trên)
+                    layers=[cone_layer, track_layer],
                     map_style="mapbox://styles/mapbox/dark-v10"
                 ))
                 
-                # Bảng chi tiết tọa độ
-                st.caption("Detailed Forecast Coordinates:")
+                st.caption("Forecast Coordinates (Next 48h):")
                 st.dataframe(track_df[['type', 'lat', 'lon']])
-
+                
         with tab4:
             # Sửa lỗi thụt dòng bằng cách ép sát lề trái hoặc dùng st.code
             st.subheader("📋 Automated Mission Report")
