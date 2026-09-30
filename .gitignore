@@ -1,11 +1,19 @@
-# --- BỎ QUA DATA NẶNG (Giữ lại trên máy, không push) ---
-data/
-data_source/
-dataset/
+# --- BỎ QUA DATA NẶNG (chỉ thư mục ở gốc repo) ---
+/data/
+/data_source/
+/dataset/
 *.h5
+*.h5.tar.gz
 *.npy
 *.zip
 *.rar
+
+# --- BỎ QUA MODEL ĐÃ TRAIN ---
+/checkpoint/
+/checkpoints/
+*.pth
+*.pt
+*.keras
 
 # --- BỎ QUA FILE RÁC HỆ THỐNG ---
 __pycache__/
@@ -15,8 +23,7 @@ __pycache__/
 .idea/
 
 # --- BỎ QUA OUTPUT KHI CHẠY CODE ---
-outputs/
-logs/
-checkpoints/
-runs/
+/outputs/
+/logs/
+/runs/
 training.log
