@@ -117,3 +117,50 @@ class TrackSeqModel(nn.Module):
         coords = self.fc_out(lstm_out) # [B, S, 2]
         
         return coords
+
+# ================== Track forecast (LightGBM) ==================
+import numpy as np
+import pandas as pd
+import joblib
+from pathlib import Path
+
+HORIZONS = (24, 48, 72)
+FEATURES = ["lat0", "lon0", "dlat_24", "dlon_24", "dlat_48", "dlon_48", "vmax"]
+
+
+def build_features(lat_m48, lon_m48, lat_m24, lon_m24, lat0, lon0, vmax):
+    """Dùng chung cho cả lúc train và lúc inference để feature luôn khớp nhau."""
+    lon_m48, lon_m24, lon0 = lon_m48 % 360, lon_m24 % 360, lon0 % 360
+    row = [lat0, lon0,
+           lat0 - lat_m24, lon0 - lon_m24,        # chuyển động 24h gần nhất
+           lat_m24 - lat_m48, lon_m24 - lon_m48,  # chuyển động 24h trước đó
+           vmax]
+    return pd.DataFrame([row], columns=FEATURES, dtype=np.float32)
+
+
+class TrackPredictor:
+    """LightGBM dự báo độ dời (dlat, dlon) ở +24/48/72h; nếu thiếu model thì dùng persistence."""
+
+    def __init__(self, model_path="models/track_lgbm.pkl"):
+        p = Path(model_path)
+        self.models = joblib.load(p)["models"] if p.exists() else None
+
+    @property
+    def is_ai(self):
+        return self.models is not None
+
+    def predict(self, history, vmax):
+        """history = [(lat,lon) -48h, (lat,lon) -24h, (lat,lon) hiện tại]"""
+        (la48, lo48), (la24, lo24), (la0, lo0) = history
+        X = build_features(la48, lo48, la24, lo24, la0, lo0, vmax)
+        lo0 = lo0 % 360
+        v_lat, v_lon = X["dlat_24"][0], X["dlon_24"][0]
+        points = []
+        for h in HORIZONS:
+            if self.is_ai:
+                dlat = float(self.models[f"lat_{h}"].predict(X)[0])
+                dlon = float(self.models[f"lon_{h}"].predict(X)[0])
+            else:
+                dlat, dlon = v_lat * h / 24, v_lon * h / 24
+            points.append({"hour": h, "lat": la0 + dlat, "lon": lo0 + dlon})
+        return {"method": "LightGBM" if self.is_ai else "Persistence", "points": points}
