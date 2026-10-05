@@ -1,222 +1,226 @@
-import torch
-import torch.nn as nn
-import torchvision.models as models
+"""
+Dự đoán quỹ đạo bão từ lịch sử vị trí (IBTrACS - Tây Bắc Thái Bình Dương).
 
-class CNNEncoder(nn.Module):
-    """
-    Trích xuất đặc trưng ảnh từng bước từ chuỗi input.
-    """
-    def __init__(self, backbone="resnet18", input_channels=1, pretrained=True, feature_dim=256):
-        super().__init__()
-        
-        # --- 1. SETUP BACKBONE (CHUẨN MỚI) ---
-        weights = None
-        if backbone == "resnet18":
-            if pretrained: weights = models.ResNet18_Weights.IMAGENET1K_V1
-            resnet = models.resnet18(weights=weights)
-        elif backbone == "resnet34":
-            if pretrained: weights = models.ResNet34_Weights.IMAGENET1K_V1
-            resnet = models.resnet34(weights=weights)
-        elif backbone == "resnet50":
-            if pretrained: weights = models.ResNet50_Weights.IMAGENET1K_V1
-            resnet = models.resnet50(weights=weights)
-        else:
-            # Fallback
-            resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+- LightGBM : mỗi cặp (mốc giờ, thành phần dlat/dlon) là một regressor riêng.
+- Persistence: ngoại suy tuyến tính vận tốc 24h gần nhất (fallback khi chưa có model).
 
-        # --- 2. XỬ LÝ INPUT CHANNEL (CHO ẢNH VỆ TINH) ---
-        if input_channels != 3:
-            original_conv1 = resnet.conv1
-            
-            resnet.conv1 = nn.Conv2d(
-                input_channels, 
-                original_conv1.out_channels, 
-                kernel_size=original_conv1.kernel_size, 
-                stride=original_conv1.stride, 
-                padding=original_conv1.padding, 
-                bias=False
-            )
-            
-            # [MẸO] Copy trọng số trung bình RGB -> Grayscale
-            if pretrained:
-                with torch.no_grad():
-                    resnet.conv1.weight[:] = torch.mean(original_conv1.weight, dim=1, keepdim=True)
+File này được dùng chung bởi train_track.py, predictor.py và app.py để đặc trưng
+lúc train và lúc chạy luôn khớp nhau.
 
-        # --- 3. FEATURE EXTRACTOR ---
-        # Loại bỏ lớp FC cuối cùng (classifier)
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-1]) # Output: [B, 512, 1, 1]
-        self.flatten = nn.Flatten()
-        
-        # Projection layer: nén vector đặc trưng xuống kích thước mong muốn (VD: 256)
-        self.proj = nn.Linear(resnet.fc.in_features, feature_dim)
+Phần LightGBM KHÔNG cần torch. CNNEncoder / TrackSeqModel (bản cũ, dùng chuỗi ảnh)
+được giữ ở cuối file để không làm hỏng code nào còn import chúng; chỉ được định
+nghĩa khi môi trường có torch.
 
-    def forward(self, x):
-        # x: [B * S, C, H, W] (Batch * Sequence gộp chung)
-        feat = self.feature_extractor(x)
-        feat = self.flatten(feat)
-        return self.proj(feat)  # [B*S, feature_dim]
+Đặt tại: source/models/track_model.py
+"""
+import os
 
-
-class TrackSeqModel(nn.Module):
-    """
-    Mô hình dự đoán quỹ đạo bão (chuỗi vị trí) dùng CNN encoder + LSTM decoder.
-    Input: Chuỗi ảnh vệ tinh [Batch, Seq, Channel, Height, Width]
-    Output: Chuỗi tọa độ (lat, lon) [Batch, Seq, 2]
-    """
-    def __init__(
-        self,
-        backbone="resnet18",
-        input_channels=1,
-        feature_dim=256,
-        lstm_hidden=128,
-        lstm_layers=1,
-        output_dim=2 # (lat, lon)
-    ):
-        super().__init__()
-        
-        # CNN Encoder dùng chung weights
-        self.cnn_encoder = CNNEncoder(
-            backbone=backbone, 
-            input_channels=input_channels, 
-            pretrained=True, 
-            feature_dim=feature_dim
-        )
-        
-        # LSTM xử lý chuỗi thời gian
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True
-        )
-        
-        # FC layer cuối ra tọa độ
-        self.fc_out = nn.Linear(lstm_hidden, output_dim)
-
-    def forward(self, x):
-        """
-        x: [B, S, C, H, W]
-        """
-        B, S, C, H, W = x.shape
-        
-        # 1. Gộp Batch và Sequence để đưa qua CNN (vì CNN chỉ nhận ảnh 2D)
-        # [B, S, C, H, W] -> [B*S, C, H, W]
-        x_reshaped = x.view(B*S, C, H, W)
-        
-        # 2. Trích xuất đặc trưng ảnh
-        feats = self.cnn_encoder(x_reshaped)  # [B*S, feature_dim]
-        
-        # 3. Trả lại chiều Sequence cho LSTM
-        # [B*S, feature_dim] -> [B, S, feature_dim]
-        feats = feats.view(B, S, -1) 
-        
-        # 4. Đưa qua LSTM
-        lstm_out, _ = self.lstm(feats) # [B, S, lstm_hidden]
-        
-        # 5. Dự đoán tọa độ
-        coords = self.fc_out(lstm_out) # [B, S, 2]
-        
-        return coords
+import numpy as np
 
 # =====================================================================
 # TRACK PREDICTION (LightGBM) — dùng bởi predictor.py và train_track.py
 # =====================================================================
-import os
-import math
-import pickle
-import numpy as np
+HORIZONS = [12, 24, 36, 48]  # giờ dự báo
 
-HORIZONS = [24, 48, 72]  # giờ dự báo
 FEATURES = [
-    "lat0", "lon0",          # vị trí hiện tại (lon 0..360)
-    "dlat24", "dlon24",      # dịch chuyển -24h -> now
-    "dlat_prev", "dlon_prev",# dịch chuyển -48h -> -24h
-    "speed24",               # quãng đường 24h gần nhất (km)
-    "vmax",                  # cường độ hiện tại (kt), có thể NaN
+    "lat0", "lon0",
+    "dlat_24", "dlon_24",   # dịch chuyển 24h gần nhất (độ; dlon đã nhân cos(lat))
+    "dlat_48", "dlon_48",   # dịch chuyển 24h trước đó
+    "acc_lat", "acc_lon",   # thay đổi vận tốc (gia tốc)
+    "speed_kmh", "head_sin", "head_cos",
+    "vmax",                 # cường độ hiện tại (kt) - từ CNN, có thể NaN
 ]
 
+# Bán kính nón sai số (km) mặc định cho Persistence - giá trị XẤP XỈ.
+# Khi có model LightGBM, giá trị đo thật trên tập validation sẽ được dùng.
+PERSISTENCE_CONE_KM = {12: 80.0, 24: 160.0, 36: 250.0, 48: 350.0}
 
-def _to360(lon):
-    return float(lon) % 360.0
+EARTH_R = 6371.0
 
 
-def _wrap_dlon(d):
-    return (d + 180.0) % 360.0 - 180.0
+# ---------------------------------------------------------------- helpers
+def dlon_deg(a, b):
+    """Hiệu kinh độ a - b, đưa về khoảng [-180, 180) (xử lý qua kinh tuyến 180)."""
+    return (np.asarray(a, dtype=float) - np.asarray(b, dtype=float) + 180.0) % 360.0 - 180.0
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Khoảng cách vòng lớn (km). Chạy được với số hoặc numpy array."""
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dp = p2 - p1
+    dl = np.radians(np.asarray(lon2, dtype=float) - np.asarray(lon1, dtype=float))
+    a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 2 * EARTH_R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
 
 def _parse_point(p):
+    """Nhận (lat, lon) hoặc {'lat':..., 'lon':...}."""
     if isinstance(p, dict):
         return float(p["lat"]), float(p["lon"])
     return float(p[0]), float(p[1])
 
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
-    a = np.sin((lat2 - lat1) / 2) ** 2 + \
-        np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
-    return 6371.0 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+def build_features(lat48, lon48, lat24, lon24, lat0, lon0, vmax=None):
+    """Tạo ma trận đặc trưng (n, len(FEATURES)) theo đúng thứ tự FEATURES.
+    Nhận số đơn hoặc numpy array (dùng cho cả train lẫn inference)."""
+    lat48, lon48, lat24, lon24, lat0, lon0 = (
+        np.asarray(v, dtype=float) for v in (lat48, lon48, lat24, lon24, lat0, lon0))
+    vmax = np.asarray(np.nan if vmax is None else vmax, dtype=float)
+    lon48, lon24, lon0 = lon48 % 360.0, lon24 % 360.0, lon0 % 360.0
+
+    dlat_24 = lat0 - lat24
+    dlon_24 = dlon_deg(lon0, lon24) * np.cos(np.radians(lat0))
+    dlat_48 = lat24 - lat48
+    dlon_48 = dlon_deg(lon24, lon48) * np.cos(np.radians(lat24))
+    speed = haversine_km(lat24, lon24, lat0, lon0) / 24.0
+    heading = np.arctan2(dlon_24, dlat_24)  # 0 = Bắc, pi/2 = Đông
+
+    cols = [lat0, lon0, dlat_24, dlon_24, dlat_48, dlon_48,
+            dlat_24 - dlat_48, dlon_24 - dlon_48,
+            speed, np.sin(heading), np.cos(heading), vmax]
+    cols = np.broadcast_arrays(*cols)
+    return np.column_stack([np.atleast_1d(c).ravel() for c in cols])
 
 
-def build_features(history, vmax=None):
-    """history: 3 điểm theo thứ tự [-48h, -24h, now], mỗi điểm (lat, lon) hoặc {'lat','lon'}."""
-    pts = [_parse_point(p) for p in history]
-    if len(pts) < 3:
-        raise ValueError("track_history cần đủ 3 điểm: -48h, -24h, now")
-    (la48, lo48), (la24, lo24), (la0, lo0) = pts[-3:]
-    lo48, lo24, lo0 = _to360(lo48), _to360(lo24), _to360(lo0)
-
-    v = float(vmax) if vmax is not None and not (isinstance(vmax, float) and math.isnan(vmax)) else np.nan
-    return {
-        "lat0": la0,
-        "lon0": lo0,
-        "dlat24": la0 - la24,
-        "dlon24": _wrap_dlon(lo0 - lo24),
-        "dlat_prev": la24 - la48,
-        "dlon_prev": _wrap_dlon(lo24 - lo48),
-        "speed24": float(haversine_km(la24, lo24, la0, lo0)),
-        "vmax": v,
-    }
-
-
+# ---------------------------------------------------------------- predictor
 class TrackPredictor:
-    """Dùng LightGBM nếu có track_lgbm.pkl, nếu không thì fallback Persistence (ngoại suy tuyến tính)."""
+    """
+    history: 3 điểm theo thứ tự cũ -> mới: [-48h, -24h, hiện tại],
+             mỗi điểm là (lat, lon) hoặc {'lat', 'lon'}.
+    vmax   : cường độ hiện tại (kt), lấy từ model CNN.
+    """
 
     def __init__(self, model_path=None):
         self.models = None
-        self.cone_km = None
-        self.method = "Persistence"
-        if model_path and os.path.exists(model_path):
-            try:
-                with open(model_path, "rb") as f:
-                    bundle = pickle.load(f)
-                self.models = bundle["models"]
-                self.cone_km = bundle.get("cone_km")
-                self.method = "LightGBM"
-            except Exception as e:
-                print(f"[TrackPredictor] Không load được {model_path}: {e} -> dùng Persistence")
+        self.horizons = list(HORIZONS)
+        self.cone_km = dict(PERSISTENCE_CONE_KM)
+        self.metrics = {}
+        self.load_error = None
+
+        if not model_path:
+            return
+        if not os.path.exists(model_path):
+            self.load_error = f"Không tìm thấy {os.path.basename(model_path)}"
+            return
+        try:
+            import joblib
+            bundle = joblib.load(model_path)
+            if list(bundle.get("features", [])) != FEATURES:
+                raise ValueError("Danh sách đặc trưng trong model không khớp FEATURES hiện tại "
+                                 "(model cũ? hãy train lại bằng train_track.py)")
+            horizons = [int(h) for h in bundle.get("horizons", HORIZONS)]
+            models = bundle["models"]
+            missing = [(h, c) for h in horizons for c in ("dlat", "dlon") if (h, c) not in models]
+            if missing:
+                raise KeyError(f"Thiếu regressor cho {missing}")
+            cone = {int(h): float(v) for h, v in bundle.get("cone_km", {}).items()}
+
+            self.models, self.horizons = models, horizons
+            self.cone_km = cone or self.cone_km
+            self.metrics = bundle.get("metrics", {})
+        except Exception as e:  # thiếu lightgbm, file hỏng, sai phiên bản...
+            self.models = None
+            self.load_error = f"{type(e).__name__}: {e}"
+            print(f"[TrackPredictor] {self.load_error} -> dùng Persistence")
+
+    @property
+    def method(self):
+        return "LightGBM" if self.models else "Persistence"
+
+    @property
+    def is_ai(self):
+        return self.models is not None
 
     def predict(self, history, vmax=None):
-        f = build_features(history, vmax)
-        lat0, lon0 = f["lat0"], f["lon0"]
-        x = np.array([[f[k] for k in FEATURES]], dtype=float)
+        pts = [_parse_point(p) for p in history]
+        if len(pts) != 3:
+            raise ValueError("history cần đúng 3 điểm: [-48h, -24h, hiện tại]")
+        (lat48, lon48), (lat24, lon24), (lat0, lon0) = pts
 
         points = []
-        for h in HORIZONS:
-            if self.models is not None:
-                dlat = float(self.models[f"{h}_dlat"].predict(x)[0])
-                dlon = float(self.models[f"{h}_dlon"].predict(x)[0])
-            else:
-                dlat = f["dlat24"] * h / 24.0
-                dlon = f["dlon24"] * h / 24.0
-            points.append({
-                "hour": h,
-                "lat": round(lat0 + dlat, 3),
-                "lon": round(_to360(lon0 + dlon), 3),  # app.py tự đổi sang -180..180
-            })
+        if self.is_ai:
+            X = build_features(lat48, lon48, lat24, lon24, lat0, lon0, vmax)
+            for h in self.horizons:
+                dlat = float(self.models[(h, "dlat")].predict(X)[0])
+                dlon = float(self.models[(h, "dlon")].predict(X)[0])
+                points.append((h, lat0 + dlat, lon0 + dlon))
+        else:
+            v_lat = (lat0 - lat24) / 24.0
+            v_lon = float(dlon_deg(lon0, lon24)) / 24.0
+            for h in self.horizons:
+                points.append((h, lat0 + v_lat * h, lon0 + v_lon * h))
 
+        default_cone = PERSISTENCE_CONE_KM.get(48, 350.0)
         return {
             "method": self.method,
+            "is_ai": self.is_ai,
             "origin": {"lat": lat0, "lon": lon0},
-            "points": points,
-            "cone_km": self.cone_km,
+            "history": [{"hour": -48, "lat": lat48, "lon": lon48},
+                        {"hour": -24, "lat": lat24, "lon": lon24},
+                        {"hour": 0, "lat": lat0, "lon": lon0}],
+            "points": [{"hour": h,
+                        "lat": round(float(np.clip(la, -89.0, 89.0)), 2),
+                        "lon": round(float(lo), 2),
+                        "cone_km": round(self.cone_km.get(h, default_cone), 0)}
+                       for h, la, lo in points],
+            "cone_km": dict(self.cone_km),
         }
+
+
+# =====================================================================
+# LEGACY: CNN + LSTM dự đoán quỹ đạo từ chuỗi ảnh (không dùng trong app).
+# Giữ lại để code cũ còn import không bị lỗi. Chỉ định nghĩa khi có torch.
+# =====================================================================
+try:
+    import torch
+    import torch.nn as nn
+    import torchvision.models as tv_models
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+if _HAS_TORCH:
+    class CNNEncoder(nn.Module):
+        """Trích xuất đặc trưng ảnh từng bước từ chuỗi input."""
+
+        def __init__(self, backbone="resnet18", input_channels=1, pretrained=True, feature_dim=256):
+            super().__init__()
+            builders = {
+                "resnet18": (tv_models.resnet18, tv_models.ResNet18_Weights.IMAGENET1K_V1),
+                "resnet34": (tv_models.resnet34, tv_models.ResNet34_Weights.IMAGENET1K_V1),
+                "resnet50": (tv_models.resnet50, tv_models.ResNet50_Weights.IMAGENET1K_V1),
+            }
+            fn, w = builders.get(backbone, builders["resnet18"])
+            resnet = fn(weights=w if pretrained else None)
+
+            if input_channels != 3:
+                old = resnet.conv1
+                resnet.conv1 = nn.Conv2d(input_channels, old.out_channels,
+                                         kernel_size=old.kernel_size, stride=old.stride,
+                                         padding=old.padding, bias=False)
+                if pretrained:
+                    with torch.no_grad():
+                        resnet.conv1.weight[:] = old.weight.mean(dim=1, keepdim=True)
+
+            self.feature_extractor = nn.Sequential(*list(resnet.children())[:-1])
+            self.flatten = nn.Flatten()
+            self.proj = nn.Linear(resnet.fc.in_features, feature_dim)
+
+        def forward(self, x):  # x: [B*S, C, H, W]
+            return self.proj(self.flatten(self.feature_extractor(x)))
+
+    class TrackSeqModel(nn.Module):
+        """CNN encoder + LSTM: chuỗi ảnh [B, S, C, H, W] -> tọa độ [B, S, 2]."""
+
+        def __init__(self, backbone="resnet18", input_channels=1, feature_dim=256,
+                     lstm_hidden=128, lstm_layers=1, output_dim=2):
+            super().__init__()
+            self.cnn_encoder = CNNEncoder(backbone, input_channels, True, feature_dim)
+            self.lstm = nn.LSTM(feature_dim, lstm_hidden, lstm_layers, batch_first=True)
+            self.fc_out = nn.Linear(lstm_hidden, output_dim)
+
+        def forward(self, x):
+            B, S, C, H, W = x.shape
+            feats = self.cnn_encoder(x.reshape(B * S, C, H, W)).reshape(B, S, -1)
+            out, _ = self.lstm(feats)
+            return self.fc_out(out)
