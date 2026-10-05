@@ -118,49 +118,105 @@ class TrackSeqModel(nn.Module):
         
         return coords
 
-# ================== Track forecast (LightGBM) ==================
+# =====================================================================
+# TRACK PREDICTION (LightGBM) — dùng bởi predictor.py và train_track.py
+# =====================================================================
+import os
+import math
+import pickle
 import numpy as np
-import pandas as pd
-import joblib
-from pathlib import Path
 
-HORIZONS = (24, 48, 72)
-FEATURES = ["lat0", "lon0", "dlat_24", "dlon_24", "dlat_48", "dlon_48", "vmax"]
+HORIZONS = [24, 48, 72]  # giờ dự báo
+FEATURES = [
+    "lat0", "lon0",          # vị trí hiện tại (lon 0..360)
+    "dlat24", "dlon24",      # dịch chuyển -24h -> now
+    "dlat_prev", "dlon_prev",# dịch chuyển -48h -> -24h
+    "speed24",               # quãng đường 24h gần nhất (km)
+    "vmax",                  # cường độ hiện tại (kt), có thể NaN
+]
 
 
-def build_features(lat_m48, lon_m48, lat_m24, lon_m24, lat0, lon0, vmax):
-    """Dùng chung cho cả lúc train và lúc inference để feature luôn khớp nhau."""
-    lon_m48, lon_m24, lon0 = lon_m48 % 360, lon_m24 % 360, lon0 % 360
-    row = [lat0, lon0,
-           lat0 - lat_m24, lon0 - lon_m24,        # chuyển động 24h gần nhất
-           lat_m24 - lat_m48, lon_m24 - lon_m48,  # chuyển động 24h trước đó
-           vmax]
-    return pd.DataFrame([row], columns=FEATURES, dtype=np.float32)
+def _to360(lon):
+    return float(lon) % 360.0
+
+
+def _wrap_dlon(d):
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def _parse_point(p):
+    if isinstance(p, dict):
+        return float(p["lat"]), float(p["lon"])
+    return float(p[0]), float(p[1])
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = np.sin((lat2 - lat1) / 2) ** 2 + \
+        np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    return 6371.0 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+def build_features(history, vmax=None):
+    """history: 3 điểm theo thứ tự [-48h, -24h, now], mỗi điểm (lat, lon) hoặc {'lat','lon'}."""
+    pts = [_parse_point(p) for p in history]
+    if len(pts) < 3:
+        raise ValueError("track_history cần đủ 3 điểm: -48h, -24h, now")
+    (la48, lo48), (la24, lo24), (la0, lo0) = pts[-3:]
+    lo48, lo24, lo0 = _to360(lo48), _to360(lo24), _to360(lo0)
+
+    v = float(vmax) if vmax is not None and not (isinstance(vmax, float) and math.isnan(vmax)) else np.nan
+    return {
+        "lat0": la0,
+        "lon0": lo0,
+        "dlat24": la0 - la24,
+        "dlon24": _wrap_dlon(lo0 - lo24),
+        "dlat_prev": la24 - la48,
+        "dlon_prev": _wrap_dlon(lo24 - lo48),
+        "speed24": float(haversine_km(la24, lo24, la0, lo0)),
+        "vmax": v,
+    }
 
 
 class TrackPredictor:
-    """LightGBM dự báo độ dời (dlat, dlon) ở +24/48/72h; nếu thiếu model thì dùng persistence."""
+    """Dùng LightGBM nếu có track_lgbm.pkl, nếu không thì fallback Persistence (ngoại suy tuyến tính)."""
 
-    def __init__(self, model_path="models/track_lgbm.pkl"):
-        p = Path(model_path)
-        self.models = joblib.load(p)["models"] if p.exists() else None
+    def __init__(self, model_path=None):
+        self.models = None
+        self.cone_km = None
+        self.method = "Persistence"
+        if model_path and os.path.exists(model_path):
+            try:
+                with open(model_path, "rb") as f:
+                    bundle = pickle.load(f)
+                self.models = bundle["models"]
+                self.cone_km = bundle.get("cone_km")
+                self.method = "LightGBM"
+            except Exception as e:
+                print(f"[TrackPredictor] Không load được {model_path}: {e} -> dùng Persistence")
 
-    @property
-    def is_ai(self):
-        return self.models is not None
+    def predict(self, history, vmax=None):
+        f = build_features(history, vmax)
+        lat0, lon0 = f["lat0"], f["lon0"]
+        x = np.array([[f[k] for k in FEATURES]], dtype=float)
 
-    def predict(self, history, vmax):
-        """history = [(lat,lon) -48h, (lat,lon) -24h, (lat,lon) hiện tại]"""
-        (la48, lo48), (la24, lo24), (la0, lo0) = history
-        X = build_features(la48, lo48, la24, lo24, la0, lo0, vmax)
-        lo0 = lo0 % 360
-        v_lat, v_lon = X["dlat_24"][0], X["dlon_24"][0]
         points = []
         for h in HORIZONS:
-            if self.is_ai:
-                dlat = float(self.models[f"lat_{h}"].predict(X)[0])
-                dlon = float(self.models[f"lon_{h}"].predict(X)[0])
+            if self.models is not None:
+                dlat = float(self.models[f"{h}_dlat"].predict(x)[0])
+                dlon = float(self.models[f"{h}_dlon"].predict(x)[0])
             else:
-                dlat, dlon = v_lat * h / 24, v_lon * h / 24
-            points.append({"hour": h, "lat": la0 + dlat, "lon": lo0 + dlon})
-        return {"method": "LightGBM" if self.is_ai else "Persistence", "points": points}
+                dlat = f["dlat24"] * h / 24.0
+                dlon = f["dlon24"] * h / 24.0
+            points.append({
+                "hour": h,
+                "lat": round(lat0 + dlat, 3),
+                "lon": round(_to360(lon0 + dlon), 3),  # app.py tự đổi sang -180..180
+            })
+
+        return {
+            "method": self.method,
+            "origin": {"lat": lat0, "lon": lon0},
+            "points": points,
+            "cone_km": self.cone_km,
+        }
