@@ -1,146 +1,189 @@
 """
-Train LightGBM track model trên IBTrACS Western Pacific.
-Đặt trong thư mục train/ cùng các script train khác. Chạy từ đâu cũng được:
-    python source/train/train_track.py
+Train model dự đoán quỹ đạo bão (LightGBM) trên IBTrACS - Tây Bắc Thái Bình Dương.
+
+Chạy (Colab hoặc máy local, CPU là đủ):
+    pip install lightgbm scikit-learn joblib pandas
+    python train_track.py                       # tự tải IBTrACS WP từ NOAA
+    python train_track.py --csv ibtracs.WP.list.v04r01.csv --out models/track_lgbm.pkl
+
+Kết quả:
+    models/track_lgbm.pkl          -> bundle joblib cho TrackPredictor
+    models/track_metrics.json      -> sai số (km) LightGBM vs Persistence trên tập test
+
+Chia dữ liệu theo năm (tránh rò rỉ giữa các cơn bão):
+    train: <= 2015 | val: 2016-2018 (early stopping + nón sai số) | test: >= 2019
 """
+import argparse
+import json
 import os
 import sys
-import pickle
-import argparse
-import urllib.request
 
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+
+from source.models.track_model import (  # noqa: E402
+    FEATURES, HORIZONS, TrackPredictor, build_features, dlon_deg, haversine_km)
+
+IBTRACS_URL = ("https://www.ncei.noaa.gov/data/international-best-track-archive-for-"
+               "climate-stewardship-ibtracs/v04r01/access/csv/ibtracs.WP.list.v04r01.csv")
+
+LGB_PARAMS = dict(n_estimators=2000, learning_rate=0.03, num_leaves=31,
+                  min_child_samples=30, subsample=0.8, subsample_freq=1,
+                  colsample_bytree=0.9, reg_lambda=1.0, verbose=-1)
 
 
-def find_repo_root():
-    """Đi ngược lên từ vị trí file cho tới thư mục chứa 'source/'."""
-    d = os.path.dirname(os.path.abspath(__file__))
-    while True:
-        if os.path.isdir(os.path.join(d, "source")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            raise RuntimeError("Không tìm thấy thư mục gốc repo (chứa 'source/')")
-        d = parent
+# ---------------------------------------------------------------- data
+def load_ibtracs(src, min_year):
+    print(f"[1/4] Đọc IBTrACS: {src}")
+    cols = ["SID", "SEASON", "ISO_TIME", "LAT", "LON", "USA_WIND", "WMO_WIND", "TRACK_TYPE"]
+    df = pd.read_csv(src, skiprows=[1], usecols=cols, low_memory=False,
+                     keep_default_na=False, na_values=["", " "])
 
+    df = df[df["TRACK_TYPE"].astype(str).str.strip() == "main"]
+    df["SEASON"] = pd.to_numeric(df["SEASON"], errors="coerce")
+    df = df[df["SEASON"] >= min_year]
 
-ROOT = find_repo_root()
-sys.path.insert(0, ROOT)
-from source.models.track_model import FEATURES, HORIZONS, build_features, haversine_km  # noqa: E402
+    df["time"] = pd.to_datetime(df["ISO_TIME"], errors="coerce")
+    df["lat"] = pd.to_numeric(df["LAT"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["LON"], errors="coerce") % 360.0
+    # USA_WIND (JTWC, gió 1 phút) cùng nguồn nhãn với TCIR -> ưu tiên
+    usa = pd.to_numeric(df["USA_WIND"], errors="coerce")
+    wmo = pd.to_numeric(df["WMO_WIND"], errors="coerce")
+    df["vmax"] = usa.fillna(wmo)
 
-IBTRACS_URL = ("https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/"
-               "v04r01/access/csv/ibtracs.WP.list.v04r01.csv")
-
-
-def wrap_dlon(d):
-    return (d + 180.0) % 360.0 - 180.0
-
-
-def load_ibtracs(path, min_year):
-    if not os.path.exists(path):
-        print(f"Downloading IBTrACS WP -> {path}")
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        urllib.request.urlretrieve(IBTRACS_URL, path)
-
-    cols = ["SID", "SEASON", "ISO_TIME", "LAT", "LON", "WMO_WIND", "USA_WIND"]
-    df = pd.read_csv(path, skiprows=[1], usecols=cols, low_memory=False)
-    for c in ["SEASON", "LAT", "LON", "WMO_WIND", "USA_WIND"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ISO_TIME"] = pd.to_datetime(df["ISO_TIME"], errors="coerce")
-    df["VMAX"] = df["USA_WIND"].fillna(df["WMO_WIND"])
-
-    df = df.dropna(subset=["ISO_TIME", "LAT", "LON", "SEASON"])
-    df = df[(df["SEASON"] >= min_year)
-            & df["ISO_TIME"].dt.hour.isin([0, 6, 12, 18])
-            & (df["ISO_TIME"].dt.minute == 0)]
-    df["LON"] = df["LON"] % 360.0
-    df = df.drop_duplicates(["SID", "ISO_TIME"]).sort_values(["SID", "ISO_TIME"])
-    print(f"Loaded {len(df):,} điểm 6h, {df['SID'].nunique():,} cơn bão (từ {min_year})")
+    df = df.dropna(subset=["time", "lat", "lon"])
+    df = df[(df["time"].dt.minute == 0) & (df["time"].dt.hour % 6 == 0)]  # chỉ mốc synop 6h
+    df = df.drop_duplicates(["SID", "time"]).sort_values(["SID", "time"])
+    df = df[["SID", "SEASON", "time", "lat", "lon", "vmax"]].reset_index(drop=True)
+    print(f"      {df['SID'].nunique()} cơn bão, {len(df)} điểm 6h")
     return df
 
 
+def _lookup(base, hours):
+    """Vị trí của cùng cơn bão tại (time + hours). NaN nếu không có."""
+    q = base[["SID", "time"]].copy()
+    q["time"] = q["time"] + pd.Timedelta(hours=hours)
+    m = q.merge(base[["SID", "time", "lat", "lon"]], on=["SID", "time"], how="left")
+    return m["lat"].to_numpy(), m["lon"].to_numpy()
+
+
 def make_samples(df):
-    rows = []
-    H = pd.Timedelta(hours=1)
-    for sid, g in df.groupby("SID"):
-        g = g.set_index("ISO_TIME")
-        if len(g) < 9:
-            continue
-        idx = set(g.index)
-        lat, lon, vmax, season = g["LAT"], g["LON"], g["VMAX"], g["SEASON"]
-        for t0 in g.index:
-            t48, t24 = t0 - 48 * H, t0 - 24 * H
-            futures = [t0 + h * H for h in HORIZONS]
-            if t48 not in idx or t24 not in idx or any(t not in idx for t in futures):
+    print("[2/4] Tạo mẫu (history -48h/-24h/0h -> tương lai +12..+48h)")
+    s = df.copy()
+    s["lat48"], s["lon48"] = _lookup(df, -48)
+    s["lat24"], s["lon24"] = _lookup(df, -24)
+    for h in HORIZONS:
+        lat_h, lon_h = _lookup(df, h)
+        s[f"dlat_{h}"] = lat_h - s["lat"].to_numpy()
+        s[f"dlon_{h}"] = np.where(np.isnan(lon_h), np.nan, dlon_deg(lon_h, s["lon"].to_numpy()))
+    s = s.dropna(subset=["lat48", "lon48", "lat24", "lon24"]).reset_index(drop=True)
+    print(f"      {len(s)} mẫu có đủ lịch sử 48h")
+    return s
+
+
+def features_of(s):
+    return build_features(s["lat48"], s["lon48"], s["lat24"], s["lon24"],
+                          s["lat"], s["lon"], s["vmax"])
+
+
+def persistence(s, h):
+    lat0, lon0 = s["lat"].to_numpy(), s["lon"].to_numpy()
+    v_lat = (lat0 - s["lat24"].to_numpy()) / 24.0
+    v_lon = dlon_deg(lon0, s["lon24"].to_numpy()) / 24.0
+    return lat0 + v_lat * h, lon0 + v_lon * h
+
+
+def track_error_km(s, h, lat_pred, lon_pred):
+    lat_true = s["lat"].to_numpy() + s[f"dlat_{h}"].to_numpy()
+    lon_true = s["lon"].to_numpy() + s[f"dlon_{h}"].to_numpy()
+    return haversine_km(lat_true, lon_true, lat_pred, lon_pred)
+
+
+# ---------------------------------------------------------------- train
+def train(samples, val_years, test_from):
+    print("[3/4] Train LightGBM (mỗi mốc giờ x {dlat, dlon} = 1 regressor)")
+    split = np.where(samples["SEASON"] < val_years[0], "train",
+                     np.where(samples["SEASON"] < test_from, "val", "test"))
+    models, cone_km, metrics = {}, {}, {"val": {}, "test": {}}
+
+    for h in HORIZONS:
+        ok = samples[f"dlat_{h}"].notna().to_numpy()
+        parts = {k: samples[ok & (split == k)].reset_index(drop=True)
+                 for k in ("train", "val", "test")}
+        X = {k: features_of(v) for k, v in parts.items()}
+
+        for comp in ("dlat", "dlon"):
+            y_tr = parts["train"][f"{comp}_{h}"].to_numpy()
+            y_va = parts["val"][f"{comp}_{h}"].to_numpy()
+            m = lgb.LGBMRegressor(**LGB_PARAMS)
+            m.fit(X["train"], y_tr, eval_set=[(X["val"], y_va)],
+                  callbacks=[lgb.early_stopping(100, verbose=False)])
+            models[(h, comp)] = m
+
+        for k in ("val", "test"):
+            p, xk = parts[k], X[k]
+            if len(p) == 0:
                 continue
-            hist = [(lat[t48], lon[t48]), (lat[t24], lon[t24]), (lat[t0], lon[t0])]
-            r = build_features(hist, vmax[t0])
-            r["season"] = int(season[t0])
-            for h, t in zip(HORIZONS, futures):
-                r[f"{h}_dlat"] = lat[t] - lat[t0]
-                r[f"{h}_dlon"] = wrap_dlon(lon[t] - lon[t0])
-            rows.append(r)
-    out = pd.DataFrame(rows)
-    print(f"Tạo được {len(out):,} mẫu")
-    return out
+            lat_p = p["lat"].to_numpy() + models[(h, "dlat")].predict(xk)
+            lon_p = p["lon"].to_numpy() + models[(h, "dlon")].predict(xk)
+            err_ai = track_error_km(p, h, lat_p, lon_p)
+            err_pe = track_error_km(p, h, *persistence(p, h))
+            metrics[k][str(h)] = {
+                "n": int(len(p)),
+                "lgbm_mean_km": round(float(err_ai.mean()), 1),
+                "lgbm_median_km": round(float(np.median(err_ai)), 1),
+                "persistence_mean_km": round(float(err_pe.mean()), 1),
+                "skill_vs_persistence_pct": round(float(100 * (1 - err_ai.mean() / err_pe.mean())), 1),
+            }
+            if k == "val":
+                # Nón sai số kiểu NHC: bán kính chứa 2/3 sai số trên tập val
+                cone_km[h] = round(float(np.percentile(err_ai, 66.7)), 0)
+
+        t = metrics["test"].get(str(h), {})
+        print(f"      +{h:2d}h | train {len(parts['train']):6d} | "
+              f"test LGBM {t.get('lgbm_mean_km', float('nan')):6.1f} km | "
+              f"Persistence {t.get('persistence_mean_km', float('nan')):6.1f} km | "
+              f"skill {t.get('skill_vs_persistence_pct', float('nan')):5.1f}% | cone {cone_km[h]:.0f} km")
+    return models, cone_km, metrics
 
 
-def train_one(Xtr, ytr, Xva, yva):
-    m = lgb.LGBMRegressor(
-        n_estimators=3000, learning_rate=0.03, num_leaves=31,
-        min_child_samples=40, subsample=0.8, subsample_freq=1,
-        colsample_bytree=0.9, reg_lambda=1.0, verbose=-1,
-    )
-    m.fit(Xtr, ytr, eval_set=[(Xva, yva)], eval_metric="l2",
-          callbacks=[lgb.early_stopping(150, verbose=False)])
-    return m
-
-
+# ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default=os.path.join(ROOT, "data", "ibtracs.WP.list.v04r01.csv"))
-    ap.add_argument("--out", default=os.path.join(ROOT, "models", "track_lgbm.pkl"))
-    ap.add_argument("--min_year", type=int, default=1980)
+    ap.add_argument("--csv", default=IBTRACS_URL, help="đường dẫn hoặc URL file IBTrACS WP")
+    ap.add_argument("--out", default=os.path.join(BASE_DIR, "models", "track_lgbm.pkl"))
+    ap.add_argument("--min-year", type=int, default=1980, help="bỏ dữ liệu trước vệ tinh hiện đại")
+    ap.add_argument("--val-start", type=int, default=2016)
+    ap.add_argument("--test-start", type=int, default=2019)
     args = ap.parse_args()
 
-    df = make_samples(load_ibtracs(args.csv, args.min_year))
-    tr = df[df["season"] <= 2014]
-    va = df[(df["season"] >= 2015) & (df["season"] <= 2016)]
-    te = df[df["season"] >= 2017]
-    print(f"Train {len(tr):,} | Val {len(va):,} | Test {len(te):,}")
+    df = load_ibtracs(args.csv, args.min_year)
+    samples = make_samples(df)
+    models, cone_km, metrics = train(samples, (args.val_start,), args.test_start)
+    metrics["split"] = {"train": f"{args.min_year}-{args.val_start - 1}",
+                        "val": f"{args.val_start}-{args.test_start - 1}",
+                        "test": f">={args.test_start}"}
 
-    Xtr, Xva, Xte = (d[FEATURES].values.astype(float) for d in (tr, va, te))
-    models, cone_km = {}, {}
-
-    print("\n Horizon | LGBM mean | LGBM p67 | Persist mean | Cải thiện")
-    for h in HORIZONS:
-        for comp in ("dlat", "dlon"):
-            key = f"{h}_{comp}"
-            models[key] = train_one(Xtr, tr[key].values, Xva, va[key].values)
-
-        lat0, lon0 = te["lat0"].values, te["lon0"].values
-        true_lat = lat0 + te[f"{h}_dlat"].values
-        true_lon = lon0 + te[f"{h}_dlon"].values
-        p_lat = lat0 + models[f"{h}_dlat"].predict(Xte)
-        p_lon = lon0 + models[f"{h}_dlon"].predict(Xte)
-        b_lat = lat0 + te["dlat24"].values * h / 24
-        b_lon = lon0 + te["dlon24"].values * h / 24
-
-        err = haversine_km(true_lat, true_lon, p_lat, p_lon)
-        err_b = haversine_km(true_lat, true_lon, b_lat, b_lon)
-        cone_km[h] = float(np.percentile(err, 67))
-        gain = (1 - err.mean() / err_b.mean()) * 100
-        print(f" {h:>4}h   | {err.mean():8.1f}  | {cone_km[h]:7.1f}  | {err_b.mean():11.1f}  | {gain:5.1f}%")
-
+    print("[4/4] Lưu model")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "wb") as f:
-        pickle.dump({"models": models, "features": FEATURES,
-                     "horizons": HORIZONS, "cone_km": cone_km}, f)
-    print(f"\nĐã lưu {args.out}")
-    print("Dán vào app.py:  TRACK_CONE_KM = "
-          + "{" + ", ".join(f"{h}: {round(v)}" for h, v in cone_km.items()) + "}")
+    joblib.dump({"models": models, "horizons": HORIZONS, "features": FEATURES,
+                 "cone_km": cone_km, "metrics": metrics,
+                 "lightgbm_version": lgb.__version__}, args.out)
+    metrics_path = os.path.join(os.path.dirname(args.out) or ".", "track_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    # Kiểm tra: load lại đúng như app sẽ load
+    tp = TrackPredictor(args.out)
+    assert tp.is_ai, f"Load lại thất bại: {tp.load_error}"
+    demo = tp.predict([(13.0, 116.0), (14.5, 114.0), (16.0, 112.0)], vmax=80)
+    print(f"      Đã lưu {args.out} + {metrics_path}")
+    print(f"      Demo: {[(p['hour'], p['lat'], p['lon']) for p in demo['points']]}")
 
 
 if __name__ == "__main__":
