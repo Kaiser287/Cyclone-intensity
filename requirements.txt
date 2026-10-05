@@ -1,9 +1,11 @@
+streamlit>=1.36
 torch
 torchvision
-streamlit
-pandas
 numpy
-Pillow
-pydeck
-tqdm
-openpyxl
+pandas
+pillow
+plotly
+lightgbm
+scikit-learn
+joblib
+requests
