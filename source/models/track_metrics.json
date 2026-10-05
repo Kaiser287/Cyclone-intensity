@@ -1,0 +1,67 @@
+{
+  "val": {
+    "12": {
+      "n": 2099,
+      "lgbm_mean_km": 109.0,
+      "lgbm_median_km": 87.3,
+      "persistence_mean_km": 129.8,
+      "skill_vs_persistence_pct": 16.0
+    },
+    "24": {
+      "n": 1915,
+      "lgbm_mean_km": 235.8,
+      "lgbm_median_km": 194.0,
+      "persistence_mean_km": 286.3,
+      "skill_vs_persistence_pct": 17.6
+    },
+    "36": {
+      "n": 1737,
+      "lgbm_mean_km": 381.2,
+      "lgbm_median_km": 316.8,
+      "persistence_mean_km": 464.3,
+      "skill_vs_persistence_pct": 17.9
+    },
+    "48": {
+      "n": 1567,
+      "lgbm_mean_km": 530.8,
+      "lgbm_median_km": 452.3,
+      "persistence_mean_km": 650.9,
+      "skill_vs_persistence_pct": 18.4
+    }
+  },
+  "test": {
+    "12": {
+      "n": 4064,
+      "lgbm_mean_km": 109.8,
+      "lgbm_median_km": 88.3,
+      "persistence_mean_km": 125.0,
+      "skill_vs_persistence_pct": 12.2
+    },
+    "24": {
+      "n": 3746,
+      "lgbm_mean_km": 236.8,
+      "lgbm_median_km": 190.6,
+      "persistence_mean_km": 277.3,
+      "skill_vs_persistence_pct": 14.6
+    },
+    "36": {
+      "n": 3432,
+      "lgbm_mean_km": 371.3,
+      "lgbm_median_km": 299.7,
+      "persistence_mean_km": 448.4,
+      "skill_vs_persistence_pct": 17.2
+    },
+    "48": {
+      "n": 3138,
+      "lgbm_mean_km": 505.4,
+      "lgbm_median_km": 412.7,
+      "persistence_mean_km": 628.3,
+      "skill_vs_persistence_pct": 19.6
+    }
+  },
+  "split": {
+    "train": "1980-2015",
+    "val": "2016-2018",
+    "test": ">=2019"
+  }
+}
