@@ -202,3 +202,35 @@ class IntensityPredictor:
     # giữ tên cũ cho app.py
     def bt_to_display(self, img_native):
         return self.to_display(img_native)
+
+
+# ---------------------------------------------------------------------------
+# Track model integration (lazy-loaded)
+# ---------------------------------------------------------------------------
+from pathlib import Path as _Path
+from source.models.track_model import TrackPredictor as _TrackPredictor
+
+DEFAULT_TRACK_PATHS = [
+    "source/models/track_lgbm.pkl",
+    "models/track_lgbm.pkl",
+    "outputs/track_lgbm.pkl",
+    "track_lgbm.pkl",
+]
+
+def _find_track_path():
+    for p in DEFAULT_TRACK_PATHS:
+        if _Path(p).exists():
+            return p
+    return None
+
+def _get_track(self):
+    if getattr(self, "_track", None) is None:
+        path = getattr(self, "track_model_path", None) or _find_track_path()
+        try:
+            self._track = _TrackPredictor(path)
+        except Exception as e:
+            print(f"[predictor] Track model load failed ({e}); using persistence fallback")
+            self._track = _TrackPredictor(None)
+    return self._track
+
+IntensityPredictor.track = property(_get_track)

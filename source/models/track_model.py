@@ -140,6 +140,10 @@ class TrackPredictor:
         points = []
         if self.is_ai:
             X = build_features(lat48, lon48, lat24, lon24, lat0, lon0, vmax)
+            _names = getattr(next(iter(self.models.values())), 'feature_name_', None)
+            if _names is not None:
+                import numpy as _np, pandas as _pd
+                X = _pd.DataFrame(_np.asarray(X).reshape(1, -1), columns=_names)
             for h in self.horizons:
                 dlat = float(self.models[(h, "dlat")].predict(X)[0])
                 dlon = float(self.models[(h, "dlon")].predict(X)[0])

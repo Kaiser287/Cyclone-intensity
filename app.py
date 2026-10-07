@@ -26,6 +26,7 @@ if ROOT not in sys.path:
 from source.inference.predictor import CATEGORIES, IntensityPredictor  # noqa: E402
 
 CKPT_CANDIDATES = [
+    os.path.join(ROOT, "source", "models", "intensity_best.pt"),
     os.path.join(ROOT, "models", "intensity_best.pt"),
     os.path.join(ROOT, "outputs", "intensity_best.pt"),
     os.path.join(ROOT, "intensity_best.pt"),
