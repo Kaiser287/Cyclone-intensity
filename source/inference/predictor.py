@@ -1,58 +1,52 @@
 """
-Intensity predictor cho model ResNet18 (1 kênh IR) train trên TCIR (WPAC),
-kèm module quỹ đạo (self.track = TrackPredictor, LightGBM hoặc Persistence).
+Intensity predictor cho model ResNet18 (1 kênh IR) train trên Cyclone Image Dataset
+(TCIR, mọi basin). Checkpoint: models/intensity_best.pt
+    dict {"model": state_dict (FP16), "stats": {...}, "in_ch": 1, "epoch": int}
 
-Đầu vào hợp lệ:
-  - .npy / np.ndarray float: nhiệt độ sáng IR1 (Kelvin), giống dữ liệu train -> chính xác nhất
-  - ảnh PNG/JPG grayscale: được quy đổi XẤP XỈ pixel -> Kelvin (xem PIXEL_TO_BT_*)
+THANG ĐO DỮ LIỆU TRAIN (quan trọng):
+  - Ảnh IR dạng 0-255, TỐI = LẠNH (mây cao, bão mạnh), SÁNG = ẤM (bão yếu).
+    Tâm bão mạnh trung bình ~49, bão yếu ~148 (tương quan với Vmax r = -0.64).
+  - Ảnh IR vệ tinh thông thường thì ngược lại: TRẮNG = LẠNH -> phải đảo trước khi đưa vào model.
 
-Đặt tại: source/inference/predictor.py
+Đầu vào hợp lệ cho predict():
+  - .npy / ndarray giá trị 0-255 (đúng định dạng dataset)       -> chính xác nhất
+  - .npy / ndarray Kelvin (giá trị > 260)                       -> quy đổi xấp xỉ
+  - PNG/JPG grayscale kiểu vệ tinh (trắng = lạnh)               -> đảo cực, xấp xỉ
 """
 import os
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 from torchvision import models
-
-from source.models.track_model import TrackPredictor
+from PIL import Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CROP = 128
+DEFAULT_CROP = 128
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_TRACK_PATHS = [
-    os.path.join(_ROOT, "models", "track_lgbm.pkl"),
-    os.path.join(_ROOT, "outputs", "track_lgbm.pkl"),
-]
+# Quy đổi Kelvin -> thang 0-255 của dataset (lạnh -> 0, ấm -> 255). Xấp xỉ, không phải hiệu chuẩn thật.
+BT_COLD = 180.0
+BT_WARM = 310.0
+KELVIN_THRESHOLD = 260.0  # mảng float có max > ngưỡng này được coi là Kelvin
 
-# Thống kê từ tập train (dùng nếu checkpoint không lưu sẵn)
-DEFAULT_STATS = {"img_mean": 250.75, "img_std": 30.20,
-                 "vmax_mean": 53.91, "vmax_std": 32.48}
-
-# Quy đổi ảnh 8-bit -> Kelvin theo quy ước ảnh IR: trắng = lạnh (mây cao)
-# pixel 255 -> 180 K, pixel 0 -> 310 K. Đây là xấp xỉ, không phải hiệu chuẩn thật.
-PIXEL_TO_BT_COLD = 180.0
-PIXEL_TO_BT_WARM = 310.0
+REQUIRED_STATS = ("img_mean", "img_std", "vmax_mean", "vmax_std")
 
 # Thang Saffir-Simpson (knots) – cùng cách chia khi đánh giá test
 CATEGORIES = [
-    (34,  "TD",  "Tropical Depression", "#4CAF50"),
-    (64,  "TS",  "Tropical Storm",      "#CDDC39"),
-    (83,  "C1",  "Typhoon Cat 1",       "#FFC107"),
-    (96,  "C2",  "Typhoon Cat 2",       "#FF9800"),
-    (113, "C3",  "Typhoon Cat 3",       "#FF5722"),
-    (137, "C4",  "Typhoon Cat 4",       "#F44336"),
-    (999, "C5",  "Super Typhoon Cat 5", "#9C27B0"),
+    (34,  "TD", "Tropical Depression", "#4CAF50"),
+    (64,  "TS", "Tropical Storm",      "#CDDC39"),
+    (83,  "C1", "Typhoon Cat 1",       "#FFC107"),
+    (96,  "C2", "Typhoon Cat 2",       "#FF9800"),
+    (113, "C3", "Typhoon Cat 3",       "#FF5722"),
+    (137, "C4", "Typhoon Cat 4",       "#F44336"),
+    (999, "C5", "Super Typhoon Cat 5", "#9C27B0"),
 ]
 
 
 # ---------------------------------------------------------------- model
 def _extract_state_dict(ckpt):
     if isinstance(ckpt, dict):
-        for key in ("model_state_dict", "state_dict", "model"):
+        for key in ("model", "model_state_dict", "state_dict"):
             if key in ckpt and isinstance(ckpt[key], dict):
                 return ckpt[key]
     return ckpt
@@ -64,8 +58,7 @@ def _clean_keys(sd):
         for p in ("module.", "_orig_mod."):
             if k.startswith(p):
                 k = k[len(p):]
-        out[k] = v
-    # bỏ prefix wrapper nếu toàn bộ key cùng prefix (vd "backbone.")
+        out[k] = v.float() if torch.is_tensor(v) and v.is_floating_point() else v  # FP16 -> FP32
     for p in ("backbone.", "net.", "model.", "resnet."):
         if all(k.startswith(p) for k in out):
             out = {k[len(p):]: v for k, v in out.items()}
@@ -82,7 +75,6 @@ def build_resnet18(sd):
     if "fc.weight" in sd:
         m.fc = nn.Linear(sd["fc.weight"].shape[1], sd["fc.weight"].shape[0])
     else:
-        # head dạng Sequential, vd [Dropout, Linear] hoặc [Linear, ReLU, Dropout, Linear]
         lin_idx = sorted({int(k.split(".")[1]) for k in sd
                           if k.startswith("fc.") and k.endswith(".weight")})
         layers = []
@@ -91,7 +83,7 @@ def build_resnet18(sd):
                 w = sd[f"fc.{i}.weight"]
                 layers.append(nn.Linear(w.shape[1], w.shape[0]))
             else:
-                layers.append(nn.ReLU())  # Dropout = identity khi eval; ReLU lặp lại vô hại
+                layers.append(nn.ReLU())  # Dropout = identity khi eval
         m.fc = nn.Sequential(*layers)
     return m
 
@@ -102,94 +94,97 @@ def _scalar(x):
 
 # ---------------------------------------------------------------- predictor
 class IntensityPredictor:
-    def __init__(self, checkpoint_path, device=DEVICE, track_model_path=None):
+    def __init__(self, checkpoint_path, device=DEVICE):
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         self.device = device
 
         try:
-            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:  # torch cũ không có weights_only
-            ckpt = torch.load(checkpoint_path, map_location=device)
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
 
         sd = _clean_keys(_extract_state_dict(ckpt))
         self.model = build_resnet18(sd)
         try:
             self.model.load_state_dict(sd, strict=True)
         except RuntimeError as e:
-            sample = list(sd.keys())[:8]
-            raise RuntimeError(f"Kiến trúc không khớp checkpoint. 8 key đầu: {sample}\n{e}")
-        self.model.to(device).eval()
+            raise RuntimeError(f"Kiến trúc không khớp checkpoint. 8 key đầu: {list(sd)[:8]}\n{e}")
+        self.model.to(device).float().eval()
 
-        # Ưu tiên stats lưu trong checkpoint, nếu không có thì dùng mặc định
-        self.stats = dict(DEFAULT_STATS)
-        if isinstance(ckpt, dict):
-            src = ckpt.get("stats", ckpt)
-            for k in DEFAULT_STATS:
-                if isinstance(src, dict) and k in src:
-                    self.stats[k] = _scalar(src[k])
+        # Stats BẮT BUỘC lấy từ checkpoint (stats Kelvin cũ không dùng được cho model này)
+        src = ckpt.get("stats", {}) if isinstance(ckpt, dict) else {}
+        missing = [k for k in REQUIRED_STATS if k not in src]
+        if missing:
+            raise KeyError(f"Checkpoint thiếu stats: {missing}. Có: {list(src)}")
+        self.stats = {k: _scalar(src[k]) for k in REQUIRED_STATS}
+        self.crop = int(src.get("crop", ckpt.get("crop", DEFAULT_CROP)))
+        self.in_ch = int(ckpt.get("in_ch", 1))
+        self.epoch = ckpt.get("epoch")
 
-        # Module quỹ đạo: không có file model -> tự fallback Persistence, không làm hỏng app
-        if track_model_path is None:
-            track_model_path = next((p for p in DEFAULT_TRACK_PATHS if os.path.exists(p)), None)
-        self.track = TrackPredictor(track_model_path)
-
-    # ---------- input -> Kelvin array (H, W)
+    # ---------- input -> mảng 0-255 theo thang dataset (tối = lạnh), shape (H, W)
     @staticmethod
-    def pixels_to_bt(gray_uint8):
-        g = gray_uint8.astype(np.float32) / 255.0
-        return PIXEL_TO_BT_WARM - g * (PIXEL_TO_BT_WARM - PIXEL_TO_BT_COLD)
+    def kelvin_to_native(bt):
+        g = (np.asarray(bt, dtype=np.float32) - BT_COLD) / (BT_WARM - BT_COLD)
+        return np.clip(g, 0, 1) * 255.0
 
-    def to_bt(self, x):
-        """Trả về (bt_array, is_approx)."""
+    @staticmethod
+    def satellite_to_native(gray_uint8):
+        """Ảnh IR vệ tinh thường (trắng = lạnh) -> thang dataset (tối = lạnh)."""
+        return 255.0 - gray_uint8.astype(np.float32)
+
+    def to_native(self, x, png_white_is_cold=True):
+        """Trả về (array_0_255, is_approx)."""
         if isinstance(x, str):
             x = np.load(x) if x.lower().endswith(".npy") else Image.open(x)
         if isinstance(x, Image.Image):
-            return self.pixels_to_bt(np.array(x.convert("L"))), True
+            g = np.array(x.convert("L"))
+            arr = self.satellite_to_native(g) if png_white_is_cold else g.astype(np.float32)
+            return arr, True
 
         arr = np.asarray(x)
-        if arr.ndim == 3:  # (H, W, C) hoặc (C, H, W) -> lấy kênh IR đầu tiên
+        if arr.ndim == 3:  # (H, W, C) hoặc (C, H, W) -> kênh IR là index 0
             arr = arr[..., 0] if arr.shape[-1] <= 4 else arr[0]
-        if arr.dtype == np.uint8:
-            return self.pixels_to_bt(arr), True
-        return arr.astype(np.float32), False
+        arr = arr.astype(np.float32)
+        if np.nanmax(arr) > KELVIN_THRESHOLD:
+            return self.kelvin_to_native(arr), True
+        return arr, False  # đã đúng thang 0-255 của dataset
 
-    def _prepare(self, bt):
-        bt = np.nan_to_num(bt, nan=self.stats["img_mean"])
-        h, w = bt.shape
-        t = torch.from_numpy(bt).float()[None, None]
-        if h >= CROP and w >= CROP and abs(h - w) <= 2 and h <= 260:
-            # ảnh TCIR gốc (~201x201): center crop như lúc train
-            top, left = (h - CROP) // 2, (w - CROP) // 2
-            t = t[..., top:top + CROP, left:left + CROP]
+    # giữ tên cũ để app.py hiện tại không phải sửa
+    def to_bt(self, x):
+        return self.to_native(x)
+
+    def _prepare(self, img):
+        img = np.nan_to_num(img, nan=self.stats["img_mean"])
+        h, w = img.shape
+        t = torch.from_numpy(img).float()[None, None]
+        c = self.crop
+        if h >= c and w >= c and abs(h - w) <= 2 and h <= 260:
+            top, left = (h - c) // 2, (w - c) // 2  # ảnh TCIR gốc: center crop như lúc train
+            t = t[..., top:top + c, left:left + c]
         else:
-            t = F.interpolate(t, size=(CROP, CROP), mode="bilinear", align_corners=False)
+            t = F.interpolate(t, size=(c, c), mode="bilinear", align_corners=False)
         t = (t - self.stats["img_mean"]) / self.stats["img_std"]
         return t.to(self.device)
 
     # ---------- inference
     @torch.no_grad()
-    def predict(self, x, tta=True, track_history=None):
-        """track_history (tuỳ chọn): [(lat,lon) -48h, (lat,lon) -24h, (lat,lon) hiện tại]."""
-        bt, approx = self.to_bt(x)
-        t = self._prepare(bt)
+    def predict(self, x, tta=True, png_white_is_cold=True):
+        img, approx = self.to_native(x, png_white_is_cold)
+        t = self._prepare(img)
         batch = torch.cat([torch.rot90(t, k, dims=(2, 3)) for k in range(4)]) if tta else t
         out = self.model(batch).float().view(-1).mean().item()
-        vmax = out * self.stats["vmax_std"] + self.stats["vmax_mean"]
-        vmax = float(max(vmax, 15.0))
+        vmax = float(max(out * self.stats["vmax_std"] + self.stats["vmax_mean"], 15.0))
 
         code, label, color = self.classify(vmax)
-        res = {
-            "wind_speed": round(vmax, 1),          # knots
+        return {
+            "wind_speed": round(vmax, 1),        # knots
             "wind_kmh": round(vmax * 1.852, 1),
             "category": code,
             "lifecycle": label,
             "color": color,
-            "approx_input": approx,                # True nếu ảnh PNG/JPG
+            "approx_input": approx,              # True nếu PNG/JPG hoặc Kelvin
         }
-        if track_history is not None:
-            res["track_history"] = self.track.predict(track_history, vmax=vmax)
-        return res
 
     @staticmethod
     def classify(vmax_kt):
@@ -199,8 +194,11 @@ class IntensityPredictor:
         return CATEGORIES[-1][1:]
 
     @staticmethod
-    def bt_to_display(bt):
-        """Kelvin -> ảnh PIL để hiển thị (trắng = lạnh)."""
-        g = (PIXEL_TO_BT_WARM - np.nan_to_num(bt, nan=PIXEL_TO_BT_WARM)) / (
-            PIXEL_TO_BT_WARM - PIXEL_TO_BT_COLD)
-        return Image.fromarray((np.clip(g, 0, 1) * 255).astype(np.uint8))
+    def to_display(img_native):
+        """Thang dataset (tối = lạnh) -> ảnh PIL kiểu vệ tinh (trắng = lạnh) để hiển thị."""
+        g = 255.0 - np.clip(np.nan_to_num(img_native, nan=255.0), 0, 255)
+        return Image.fromarray(g.astype(np.uint8))
+
+    # giữ tên cũ cho app.py
+    def bt_to_display(self, img_native):
+        return self.to_display(img_native)
